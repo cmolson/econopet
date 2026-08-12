@@ -8,7 +8,7 @@
 // IEEE-488 disk-drive emulation (devices 8 and 9, two drives each), backed
 // by Commodore disk images on the SD card:
 //
-//   /disks/drive0..drive3.{d80,d64} -> slots 0-3 (slot = unit*2 + drive)
+//   /disks/drive0..drive3.{d80,d64,hdd} -> slots 0-3 (slot = unit*2 + drive)
 //
 // The FPGA (ieee.sv) runs the bus handshake and exposes byte FIFOs over
 // SPI/Wishbone; this module implements the DOS layer: OPEN by filename,
