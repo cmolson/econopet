@@ -64,6 +64,21 @@ const uint8_t* roms_get_char_rom(bool video_graphics) {
     return base + (video_graphics ? 0x400 : 0x000);
 }
 
+const uint8_t* roms_get_ascii_char_rom(void) {
+    // The quadrant with a plain ASCII layout ('A' at $41, 'a' at $61),
+    // independent of the live CRTC/CA2 charset selection: quadrant 2 of the
+    // 4KB SuperPET ROM (901640-01), or the
+    // text half of a standard 2KB ROM. Used for firmware-painted overlay
+    // text that must stay readable when software switches charsets (APL).
+    const uint8_t* base = rom_chars_e800;
+    size_t size = sizeof(rom_chars_e800);
+    if (custom_char_rom_size == 2048 || custom_char_rom_size == 4096) {
+        base = custom_char_rom;
+        size = custom_char_rom_size;
+    }
+    return base + (size >= 4096 ? 2 * 0x400 : 0x000);
+}
+
 void start_menu_rom(menu_rom_boot_reason_t reason) {
     // Menu ROM is 6502 code -- force the soft 6502 even when re-entering
     // from a 6809 session.
