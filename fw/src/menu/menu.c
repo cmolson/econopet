@@ -12,6 +12,7 @@
 #include "display/dvi/dvi.h"
 #include "display/window.h"
 #include "driver.h"
+#include "ieee/ieee_drive.h"
 #include "fatal.h"
 #include "filesystem/vfs.h"
 #include "global.h"
@@ -193,7 +194,12 @@ void action_set_options(void* context, options_t* options) {
     // uses the stock PET charset.
     ctx->system_state->superpet_charset = (cpu == CPU_SOFT_6809);
 
-    log_debug("Set options: %lu columns, video RAM mask %lu", options->columns, options->video_ram_mask);
+    ieee_drive_set_enabled(options->ieee_drive);
+
+    log_debug("Set options: %lu columns, video RAM mask %lu, ieee-drive %s",
+              options->columns, options->video_ram_mask,
+              options->ieee_drive ? "on" : "off");
+
 }
 
 void read_keymap_callback(size_t offset, uint8_t* buffer, size_t bytes_read, void* context) {
