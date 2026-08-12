@@ -12,3 +12,6 @@
 
 #define FW_GIT_HASH "@GIT_HASH@"
 #define FW_GIT_DIRTY @GIT_DIRTY@
+
+// Per-build UTC timestamp; see GenVersion.cmake.
+#define FW_BUILD_ID "@BUILD_ID@"

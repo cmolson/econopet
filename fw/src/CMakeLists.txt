@@ -8,14 +8,28 @@ add_compile_options(-Wall -Wextra -Wnull-dereference)
 # Include ROM header generation function
 include(${FW_DIR}/cmake/AddRomHeader.cmake)
 
-# Include git version information
+# Configure-time version.h, so the file exists for the first dependency scan.
 include(${FW_DIR}/cmake/GitVersion.cmake)
-
-# Generate version header in build directory
 configure_file(
     ${FW_DIR}/cmake/version.h.in
     ${CMAKE_CURRENT_BINARY_DIR}/version.h
     @ONLY
+)
+
+# Regenerate version.h every build (see GenVersion.cmake).
+add_custom_target(fw_version ALL
+    COMMAND ${CMAKE_COMMAND}
+        -DIN_FILE=${FW_DIR}/cmake/version.h.in
+        -DOUT_FILE=${CMAKE_CURRENT_BINARY_DIR}/version.h
+        -DSRC_DIR=${CMAKE_SOURCE_DIR}
+        -DVER_MAJOR=${PROJECT_VERSION_MAJOR}
+        -DVER_MINOR=${PROJECT_VERSION_MINOR}
+        -DVER_PATCH=${PROJECT_VERSION_PATCH}
+        -DVER_STRING=${PROJECT_VERSION}
+        -P ${FW_DIR}/cmake/GenVersion.cmake
+    BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/version.h
+    COMMENT "Regenerating firmware version (unique per build)"
+    VERBATIM
 )
 
 # Include external projects
@@ -60,6 +74,7 @@ add_executable(${FW_EXECUTABLE_NAME}
     ${FW_SRC_DIR}/display/window.c
     ${FW_SRC_DIR}/system_state.c
     ${FW_SRC_DIR}/tape.c
+    ${FW_SRC_DIR}/version.c
     ${FW_SRC_DIR}/tape_dir.c
     ${FW_SRC_DIR}/term_inject.c
     ${FW_SRC_DIR}/pet.c
@@ -163,6 +178,9 @@ add_rom_header(${FW_EXECUTABLE_NAME}
 
 # Add build directory to include path for generated ROM headers
 target_include_directories(${FW_EXECUTABLE_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+# Refresh version.h before the firmware links.
+add_dependencies(${FW_EXECUTABLE_NAME} fw_version)
 
 # create map/bin/hex/uf2 file etc.
 pico_add_extra_outputs(${FW_EXECUTABLE_NAME})
