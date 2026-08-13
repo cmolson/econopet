@@ -27,6 +27,7 @@ message(STATUS "ECONOPET_ROMS_DIR=${ECONOPET_ROMS_DIR}")
 option(BUILD_ROM "Build the 6502 ROM subproject" ON)
 option(BUILD_FPGA "Build the FPGA gateware subproject" ON)
 option(BUILD_FIRMWARE "Build the RP2040 firmware subproject" ON)
+option(BUILD_BOOTLOADER "Build the RP2040 SD-card bootloader subproject" ON)
 option(BUILD_TESTS "Build the firmware unit tests" ON)
 option(BUILD_SDCARD "Build the SD card package" ON)
 option(BUILD_PRGS "Build the test programs" ON)
@@ -96,6 +97,44 @@ if(BUILD_FIRMWARE)
 endif()
 
 # ============================================================================
+# Bootloader Subproject (RP2040 SD-card bootloader, fw/external submodule)
+# ============================================================================
+if(BUILD_BOOTLOADER)
+    # The FPGA-preload option configures the FPGA from the SD card before the
+    # slow erase/program pass so the CRT stays driven during firmware updates.
+    # Pin/clock values mirror fw/src/hw.h.
+    set(BOOTLOADER_CMAKE_ARGS
+        -G Ninja
+        -DCMAKE_BUILD_TYPE=Release
+        -DPICO_PLATFORM=rp2040
+        -DPICO_SDK_PATH=$ENV{PICO_SDK_PATH}
+        -DCMAKE_TOOLCHAIN_FILE=$ENV{PICO_SDK_PATH}/cmake/preload/toolchains/pico_arm_cortex_m0plus_gcc.cmake
+        -DBOOTLOADER_FPGA_PRELOAD=true
+        -DBOOTLOADER_FPGA_BITSTREAM_FILENAME=/fpga/EconoPET.hex.bin
+        -DBOOTLOADER_FPGA_SPI_INSTANCE=spi0
+        -DBOOTLOADER_FPGA_SPI_MHZ=24
+        -DBOOTLOADER_FPGA_SPI_CSN_GP=5
+        -DBOOTLOADER_FPGA_SPI_SCK_GP=6
+        -DBOOTLOADER_FPGA_SPI_SDO_GP=7
+        -DBOOTLOADER_FPGA_SPI_SDI_GP=4
+        -DBOOTLOADER_FPGA_CRESET_GP=26
+        -DBOOTLOADER_FPGA_CLK_GP=15
+        -DBOOTLOADER_FPGA_CLK_DIV=15
+        -DBOOTLOADER_FPGA_SYS_KHZ=270000
+    )
+
+    ExternalProject_Add(bootloader_project
+        SOURCE_DIR ${CMAKE_SOURCE_DIR}/fw/external/pico-sdcard-bootloader
+        BINARY_DIR ${SUPER_BUILD_DIR}/bootloader
+        CMAKE_ARGS ${BOOTLOADER_CMAKE_ARGS}
+        BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target bootloader
+        INSTALL_COMMAND ""
+        BUILD_ALWAYS TRUE
+    )
+    set(BOOTLOADER_UF2 ${SUPER_BUILD_DIR}/bootloader/src/boot3/bootloader.uf2)
+endif()
+
+# ============================================================================
 # Firmware Tests Subproject (Linux host tests)
 # ============================================================================
 if(BUILD_TESTS)
@@ -123,11 +162,11 @@ endif()
 # ============================================================================
 # SD Card Package (depends on ROM, FPGA, and Firmware)
 # ============================================================================
-if(BUILD_SDCARD AND BUILD_FIRMWARE AND BUILD_FPGA)
+if(BUILD_SDCARD AND BUILD_FIRMWARE AND BUILD_FPGA AND BUILD_BOOTLOADER)
     ExternalProject_Add(sdcard_project
         SOURCE_DIR ${CMAKE_SOURCE_DIR}/sdcard
         BINARY_DIR ${SUPER_BUILD_DIR}/sdcard
-        DEPENDS firmware_project fpga_project
+        DEPENDS firmware_project fpga_project bootloader_project
         CMAKE_ARGS
             -G Ninja
             -DPICO_PLATFORM=rp2040
@@ -135,6 +174,7 @@ if(BUILD_SDCARD AND BUILD_FIRMWARE AND BUILD_FPGA)
             -DCMAKE_TOOLCHAIN_FILE=$ENV{PICO_SDK_PATH}/cmake/preload/toolchains/pico_arm_cortex_m0plus_gcc.cmake
             -DFIRMWARE_UF2=${FIRMWARE_UF2}
             -DFPGA_BITSTREAM=${FPGA_BITSTREAM}
+            -DBOOTLOADER_UF2=${BOOTLOADER_UF2}
         BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR>
         INSTALL_COMMAND ""
         BUILD_ALWAYS TRUE
@@ -176,6 +216,7 @@ add_custom_target(all_projects
         $<$<BOOL:${BUILD_ROM}>:rom_project>
         $<$<BOOL:${BUILD_FPGA}>:fpga_project>
         $<$<BOOL:${BUILD_FIRMWARE}>:firmware_project>
+        $<$<BOOL:${BUILD_BOOTLOADER}>:bootloader_project>
         $<$<BOOL:${BUILD_TESTS}>:test_project>
         $<$<BOOL:${BUILD_SDCARD}>:sdcard_project>
         $<$<BOOL:${BUILD_PRGS}>:prgs_project>

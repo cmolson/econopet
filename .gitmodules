@@ -21,3 +21,9 @@
 [submodule "gw/EconoPET/external/m6502"]
 	path = gw/EconoPET/external/m6502
 	url = https://github.com/DLehenbauer/m6502.git
+[submodule "fw/external/pico-sdcard-bootloader"]
+	path = fw/external/pico-sdcard-bootloader
+	# cmolson's fork carries the FPGA-preload option (PR pending against
+	# DLehenbauer/pico-sdcard-bootloader); repoint once it merges upstream.
+	url = https://github.com/cmolson/pico-sdcard-bootloader.git
+	branch = feat/fpga-preload

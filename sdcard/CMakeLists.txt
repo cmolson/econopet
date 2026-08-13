@@ -25,7 +25,6 @@ endif()
 # during configuration.
 file(MAKE_DIRECTORY "${sdcard_rom_dir}")
 file(COPY "${CMAKE_CURRENT_LIST_DIR}/config.yaml" DESTINATION "${sdcard_root_dir}")
-file(COPY "${CMAKE_CURRENT_LIST_DIR}/bootloader.uf2" DESTINATION "${sdcard_root_dir}")
 file(COPY "${CMAKE_CURRENT_LIST_DIR}/README.md" DESTINATION "${sdcard_root_dir}")
 file(COPY "${CMAKE_CURRENT_LIST_DIR}/../NOTICE.md" DESTINATION "${sdcard_root_dir}")
 file(COPY "${CMAKE_CURRENT_LIST_DIR}/ukm" DESTINATION "${sdcard_root_dir}")
@@ -69,8 +68,13 @@ if(NOT DEFINED FPGA_BITSTREAM)
     message(FATAL_ERROR "FPGA_BITSTREAM must be defined (path to EconoPET.hex.bin)")
 endif()
 
+if(NOT DEFINED BOOTLOADER_UF2)
+    message(FATAL_ERROR "BOOTLOADER_UF2 must be defined (path to bootloader.uf2)")
+endif()
+
 message(STATUS "Firmware UF2: ${FIRMWARE_UF2}")
 message(STATUS "FPGA Bitstream: ${FPGA_BITSTREAM}")
+message(STATUS "Bootloader UF2: ${BOOTLOADER_UF2}")
 
 # Copy firmware UF2 into the SD card root at build time
 add_custom_command(
@@ -81,6 +85,19 @@ add_custom_command(
             "${sdcard_root_dir}/firmware.uf2"
     DEPENDS "${FIRMWARE_UF2}"
     COMMENT "Copying firmware.uf2 to SD card root"
+    VERBATIM
+)
+
+# Copy the bootloader UF2 (built from fw/external/pico-sdcard-bootloader)
+# into the SD card root at build time
+add_custom_command(
+    OUTPUT "${sdcard_root_dir}/bootloader.uf2"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${sdcard_root_dir}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${BOOTLOADER_UF2}"
+            "${sdcard_root_dir}/bootloader.uf2"
+    DEPENDS "${BOOTLOADER_UF2}"
+    COMMENT "Copying bootloader.uf2 to SD card root"
     VERBATIM
 )
 
@@ -107,6 +124,7 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E tar cf "${sdcard_zip_path}" --format=zip .
     WORKING_DIRECTORY "${sdcard_root_dir}"
     DEPENDS "${sdcard_root_dir}/firmware.uf2"
+            "${sdcard_root_dir}/bootloader.uf2"
             "${sdcard_root_dir}/fpga/EconoPET.hex.bin"
             ${sdcard_rom_outputs}
     COMMENT "Zipping SD card contents to ${sdcard_zip_path}"
