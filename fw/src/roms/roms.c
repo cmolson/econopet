@@ -69,6 +69,8 @@ void start_menu_rom(menu_rom_boot_reason_t reason) {
     // from a 6809 session.
     set_cpu_type(CPU_SOFT_6502);
 
+    system_state.superpet_charset = false;              // Menu uses the stock PET charset
+
     vet(reason < 2, "Menu ROM boot reason out of range: %d", reason);
     
     const unsigned int MENU_ROM_START = 0xFF00;

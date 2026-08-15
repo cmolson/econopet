@@ -189,6 +189,10 @@ void action_set_options(void* context, options_t* options) {
     }
     set_cpu_type(cpu);
 
+    // The SuperPET (6809) uses the Waterloo character ROM; a 6502
+    // uses the stock PET charset.
+    ctx->system_state->superpet_charset = (cpu == CPU_SOFT_6809);
+
     log_debug("Set options: %lu columns, video RAM mask %lu", options->columns, options->video_ram_mask);
 }
 

@@ -123,6 +123,12 @@ typedef struct system_state_s {
     // Video graphics mode flag (false = lowercase/business charset, true = uppercase/graphics charset)
     bool video_graphics;
 
+    // True when the Waterloo/SuperPET character ROM is active (lowercase at its
+    // ASCII positions $61-$7A). Selects how firmware-painted text is
+    // encoded: passthrough for the SuperPET charset, ascii_to_vrom for the
+    // stock PET charset (whose lowercase lives elsewhere).
+    bool superpet_charset;
+
     // True when the FPGA has halted the CPU on a breakpoint (STP opcode)
     bool bp_halted;
 
