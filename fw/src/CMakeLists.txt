@@ -60,6 +60,10 @@ add_executable(${FW_EXECUTABLE_NAME}
     ${FW_SRC_DIR}/display/window.c
     ${FW_SRC_DIR}/system_state.c
     ${FW_SRC_DIR}/tape.c
+    ${FW_SRC_DIR}/ieee/diskimage.c
+    ${FW_SRC_DIR}/ieee/ieee_drive.c
+    ${FW_SRC_DIR}/display/hud.c
+    ${FW_SRC_DIR}/display/hud_trigger.c
     ${FW_SRC_DIR}/tape_dir.c
     ${FW_SRC_DIR}/term_inject.c
     ${FW_SRC_DIR}/pet.c

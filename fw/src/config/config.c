@@ -5,6 +5,7 @@
 #include "config.h"
 
 #include "display/display.h"
+#include "driver.h"
 #include "fatal.h"
 #include "global.h"
 #include "sd/sd.h"
@@ -494,12 +495,22 @@ static void parse_action_set(parser_t* parser, void* context, size_t context_siz
         .capacity = TAPE_CONFIG_SIZE,
     };
 
+    // 'ieee-drive' defaults off (real drives on the bus); "on"/"true"/"1"
+    // enables units 8 and 9.
+    char ieee_drive_str[8] = { 0 };
+
+    // 'cpu' selects the in-fabric CPU; default auto (the
+    // physical 6502 when populated, else the soft core).
+    char cpu_str[16] = { 0 };
+
     options_t options = {
         .columns = 40,          // Default value
         .video_ram_mask = 0,    // Default value (will be derived from video_ram_kb)
         .usb_keymap = { 0 },    // Default: empty (use default keymap)
         .tape = { 0 },          // Default: disabled
         .tape_enabled = false,
+        .ieee_drive = false,    // Default: disabled
+        .cpu = CPU_AUTO,        // Default: physical 6502 if populated, else soft
     };
 
     parse_mapping_continued(parser, (const map_dispatch_entry_t[]) {
@@ -507,8 +518,22 @@ static void parse_action_set(parser_t* parser, void* context, size_t context_siz
         { "video-ram-kb", parse_as_uint32, &video_ram_kb, sizeof(video_ram_kb) },
         { "usb-keymap", parse_as_string, &options.usb_keymap, sizeof(options.usb_keymap) },
         { "tape", parse_as_hex, &tape_blob, sizeof(tape_blob) },
+        { "ieee-drive", parse_as_string, &ieee_drive_str, sizeof(ieee_drive_str) },
+        { "cpu", parse_as_string, &cpu_str, sizeof(cpu_str) },
         { NULL, NULL, NULL, 0 }
     });
+
+    options.ieee_drive = (strcmp(ieee_drive_str, "on") == 0)
+                      || (strcmp(ieee_drive_str, "true") == 0)
+                      || (strcmp(ieee_drive_str, "1") == 0);
+
+    if (cpu_str[0] != '\0') {
+        if      (strcmp(cpu_str, "6809") == 0)     options.cpu = CPU_SOFT_6809;
+        else if (strcmp(cpu_str, "6502") == 0)     options.cpu = CPU_SOFT_6502;
+        else if (strcmp(cpu_str, "physical") == 0) options.cpu = CPU_PHYS_6502;
+        else if (strcmp(cpu_str, "auto") == 0)     options.cpu = CPU_AUTO;
+        else fatal_parse_error(parser, "Invalid cpu: '%s' (expected 6809, 6502, physical, or auto)", cpu_str);
+    }
 
     if (options.columns != 40 && options.columns != 80) {
         fatal_parse_error(parser, "Invalid number of columns: %u (must be 40 or 80)", options.columns);

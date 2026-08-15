@@ -12,6 +12,7 @@
 #include "display/dvi/dvi.h"
 #include "display/window.h"
 #include "driver.h"
+#include "ieee/ieee_drive.h"
 #include "fatal.h"
 #include "filesystem/vfs.h"
 #include "global.h"
@@ -181,7 +182,24 @@ void action_set_options(void* context, options_t* options) {
 
     tape_init(options->tape_enabled ? &options->tape : NULL);
 
-    log_debug("Set options: %lu columns, video RAM mask %lu", options->columns, options->video_ram_mask);
+    // CPU is halted here (load_config left it not-ready) and re-reset by
+    // pet_reset().
+    cpu_type_t cpu = (cpu_type_t) options->cpu;
+    if (cpu == CPU_AUTO) {
+        cpu = physical_cpu_present() ? CPU_PHYS_6502 : CPU_SOFT_6502;
+    }
+    set_cpu_type(cpu);
+
+    // The SuperPET (6809) uses the Waterloo character ROM; a 6502
+    // uses the stock PET charset.
+    ctx->system_state->superpet_charset = (cpu == CPU_SOFT_6809);
+
+    ieee_drive_set_enabled(options->ieee_drive);
+
+    log_debug("Set options: %lu columns, video RAM mask %lu, ieee-drive %s",
+              options->columns, options->video_ram_mask,
+              options->ieee_drive ? "on" : "off");
+
 }
 
 void read_keymap_callback(size_t offset, uint8_t* buffer, size_t bytes_read, void* context) {
@@ -242,6 +260,10 @@ void menu_enter(bool is_boot) {
     log_info("-- Enter Menu --");
 
     tape_deinit();
+
+    // The menu ROM needs a 6502: use the socketed CPU if present, else the
+    // soft core (the fabric powers on with the physical CPU selected).
+    set_cpu_type(physical_cpu_present() ? CPU_PHYS_6502 : CPU_SOFT_6502);
 
     system_state.video_source = video_source_firmware;
     

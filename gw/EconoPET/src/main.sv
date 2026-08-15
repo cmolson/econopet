@@ -31,6 +31,12 @@ module main (
     output logic cpu_we_o,
     output logic cpu_we_oe,
 
+    // SuperPET RS-232 (soft 6551 ACIA -> PMOD2, wired in top.sv)
+    output logic uart_txd_o,
+    input  logic uart_rxd_i,
+    output logic uart_rts_n_o,
+    input  logic uart_cts_n_i,
+
     // RAM
     output logic ram_addr_a10_o,
     output logic ram_addr_a11_o,
@@ -90,6 +96,8 @@ module main (
     logic kbd_wb_sel;
     logic crtc_wb_sel;
     logic bram_wb_sel;
+    logic ieee_wb_sel;
+    logic hud_wb_sel;
 
     always_comb begin
         ram_wb_sel = 1'b0;
@@ -97,6 +105,8 @@ module main (
         kbd_wb_sel = 1'b0;
         crtc_wb_sel = 1'b0;
         bram_wb_sel = 1'b0;
+        ieee_wb_sel = 1'b0;
+        hud_wb_sel = 1'b0;
 
         unique casez (wb_addr)
             {WB_RAM_BASE,  {(WB_ADDR_WIDTH - $bits(WB_RAM_BASE)){1'b?}}}: ram_wb_sel = 1'b1;
@@ -104,6 +114,8 @@ module main (
             {WB_KBD_BASE,  {(WB_ADDR_WIDTH - $bits(WB_KBD_BASE)){1'b?}}}: kbd_wb_sel = 1'b1;
             {WB_CRTC_BASE, {(WB_ADDR_WIDTH - $bits(WB_CRTC_BASE)){1'b?}}}: crtc_wb_sel = 1'b1;
             {WB_BRAM_BASE, {(WB_ADDR_WIDTH - $bits(WB_BRAM_BASE)){1'b?}}}: bram_wb_sel = 1'b1;
+            {WB_IEEE_BASE, {(WB_ADDR_WIDTH - $bits(WB_IEEE_BASE)){1'b?}}}: ieee_wb_sel = 1'b1;
+            {WB_HUD_BASE,  {(WB_ADDR_WIDTH - $bits(WB_HUD_BASE)){1'b?}}}: hud_wb_sel = 1'b1;
             default: /* do nothing */ ;
         endcase
     end
@@ -143,10 +155,6 @@ module main (
     // For now, IRQ is never driven by FPGA.
     assign cpu_irq_o   = 0;
 
-    // For now, CPU always drives RWB, which is independent from RAM OE/WE.
-    assign cpu_we_o    = 0;
-    assign cpu_we_oe   = 0;
-
     logic clk16_en;
     logic clk8_en;
     logic cpu_addr_strobe;  // Pulsed when cpu_addr_i is valid
@@ -158,11 +166,30 @@ module main (
     logic [0:0] grant;
     logic grant_valid;
 
+    // timing.sv's cpu_be_o drives internal RAM-address muxing (via
+    // timing_cpu_be) and, in 6502 mode, the physical W65C02S's bus-enable.
+    logic timing_cpu_be;
+
+    // CPU select, driven by the register file below (REG_CPU_SEL).
+    // Three options share one bitstream; switching does not reconfigure the
+    // FPGA, so the CRT never loses sync. Each unselected core is held in reset.
+    //   soft 6809  : SuperPET
+    //   soft 6502  : virtual PET CPU (runs the boot menu; also fully simulatable)
+    //   phys 6502  : the socketed W65C02S (may be unpopulated)
+    logic [1:0] cpu_sel;
+    wire cpu_is_6809     = (cpu_sel == CPU_SEL_SOFT_6809);
+    wire cpu_is_soft6502 = (cpu_sel == CPU_SEL_SOFT_6502);
+
+    // Both soft cores have no bus pins, so the FPGA drives the shared
+    // address / R-W / write-data lines for them. The physical W65C02S drives
+    // those itself, so the FPGA releases them when it is selected.
+    wire cpu_soft        = cpu_is_6809 || cpu_is_soft6502;
+
     timing timing (
         .sys_clock_i(sys_clock_i),
         .clk16_en_o(clk16_en),
         .clk8_en_o(clk8_en),
-        .cpu_be_o(cpu_be_o),
+        .cpu_be_o(timing_cpu_be),
         .cpu_addr_strobe_o(cpu_addr_strobe),
         .cpu_clock_o(cpu_clock_o),
         .cpu_data_strobe_o(cpu_data_strobe),
@@ -174,7 +201,168 @@ module main (
         .grant_valid_o(grant_valid)
     );
 
-    wire cpu_wr_strobe = cpu_data_strobe && cpu_we_i;
+    // Physical 6502 bus-enable. In 6809 mode the physical CPU stays socketed
+    // but off the bus (BE low -> its address/data/R-W buffers are high-Z) so
+    // the soft 6809 drives the shared bus instead. In 6502 mode the arbiter's
+    // window (timing_cpu_be) enables the physical CPU to own the bus. See
+    // hw/rev-b/.../CPU.kicad_sch: "When the FPGA drives the bus, it deasserts
+    // BE ... to place the CPU's Address, Data, and R/~W buffers in high-Z."
+    assign cpu_be_o = cpu_soft ? 1'b0 : timing_cpu_be;
+
+    //
+    // SuperPET soft 6809
+    //
+    // mc6809i is the vendored cavnex/mc6809 core (external/mc6809), wired
+    // directly (not through the mc6809.v/mc6809e.v wrappers) because
+    // timing_6809 generates E/Q itself rather than relying on the wrapper's
+    // own MRDY-gated clock-phase generator.
+    //
+
+    logic [DATA_WIDTH-1:0] mc6809_dout;
+    logic [CPU_ADDR_WIDTH-1:0] mc6809_addr;
+    logic mc6809_rnw, mc6809_bs, mc6809_ba, mc6809_avma, mc6809_busy, mc6809_lic;
+    logic [111:0] mc6809_regdata;
+
+    logic cpu6809_be, cpu6809_e, cpu6809_q;
+    logic cpu6809_addr_strobe, cpu6809_data_strobe, cpu6809_hold_strobe, cpu6809_wr_en;
+
+    // cpu_irq_i is asynchronous to sys_clock_i (wire-ORed by the real
+    // PIA1/PIA2/VIA chips), so double-flop it before mc6809i's nIRQ.
+    logic [1:0] cpu_irq_sync = 2'b00;
+    always_ff @(posedge sys_clock_i) begin
+        cpu_irq_sync <= { cpu_irq_sync[0], cpu_irq_i };
+    end
+
+    // Soft 6551 ACIA (RS-232) interrupt, ORed into the shared IRQ below --
+    // on the real board the 6551's open-drain ~IRQ is wire-ORed onto the
+    // same line as the motherboard PIA/VIA interrupts.
+    logic acia_irq;
+
+    // Super-OS/9 MMU state (driven by address_decoding below).
+    logic superpet_flat;
+    logic superpet_wp;
+    logic superpet_firq_n;
+
+    timing_6809 timing_6809 (
+        .sys_clock_i(sys_clock_i),
+        .cpu_be_i(timing_cpu_be),
+        .cpu_clock_i(cpu_clock_o),
+        .cpu_addr_strobe_i(cpu_addr_strobe),
+        .cpu_data_strobe_i(cpu_data_strobe),
+        .cpu_hold_strobe_i(cpu_hold_strobe),
+        .cpu_wr_en_i(cpu_wr_en),
+
+        .cpu6809_be_o(cpu6809_be),
+        .cpu6809_e_o(cpu6809_e),
+        .cpu6809_q_o(cpu6809_q),
+        .cpu6809_addr_strobe_o(cpu6809_addr_strobe),
+        .cpu6809_data_strobe_o(cpu6809_data_strobe),
+        .cpu6809_hold_strobe_o(cpu6809_hold_strobe),
+        .cpu6809_wr_en_o(cpu6809_wr_en)
+    );
+
+    // Registered bus copy for soft-6809 consumers: one short pin-to-FF path
+    // instead of an unconstrained fan-out cone. Paired with the delayed data
+    // strobe in timing_6809. Video/WB keep the raw pins.
+    logic [DATA_WIDTH-1:0] cpu_data_q;
+    always_ff @(posedge sys_clock_i) begin
+        cpu_data_q <= cpu_data_i;
+    end
+
+    mc6809i mc6809 (
+        .D(cpu_data_q),
+        .DOut(mc6809_dout),
+        .ADDR(mc6809_addr),
+        .RnW(mc6809_rnw),
+        .E(cpu6809_e),
+        .Q(cpu6809_q),
+        .BS(mc6809_bs),
+        .BA(mc6809_ba),
+        .nIRQ(!(cpu_irq_sync[1] || acia_irq)),
+        // No physical FIRQ line on this board (tied +5V on a real SuperPET
+        // too); only the Super-OS/9 MMU pulses it, to wake the core out of
+        // the flat-mode-exiting SYNC.
+        .nFIRQ(superpet_firq_n),
+        .nNMI(1'b1),
+        .AVMA(mc6809_avma),
+        .BUSY(mc6809_busy),
+        .LIC(mc6809_lic),
+        .nHALT(1'b1),
+        // Held in reset whenever the physical 6502 owns the bus, so the soft
+        // core is quiescent and never drives the shared bus in 6502 mode.
+        .nRESET(!cpu_reset_i && cpu_is_6809),
+        .nDMABREQ(1'b1),
+        .RegData(mc6809_regdata)
+    );
+
+    // Soft MOS 6502 core (external/m6502) -- the virtual PET CPU. Clocked by
+    // the same ~1MHz PET clock the physical W65C02S uses (cpu_clock_o), so it
+    // shares the physical CPU's bus timing (timing_cpu_be / cpu_*_strobe).
+    // Held in reset unless selected; outputs muxed into active_* below.
+    logic [CPU_ADDR_WIDTH-1:0] m6502_addr;
+    logic [    DATA_WIDTH-1:0] m6502_dout;
+    logic                      m6502_rw;    // 1 = read, 0 = write
+    logic                      m6502_sync;  // opcode-fetch marker (SYNC)
+
+    cpu_6502 cpu_6502 (
+        .i_clk(cpu_clock_o),
+        .o_phi1(),
+        .o_phi2(),
+        .i_reset_n(!cpu_reset_i && cpu_is_soft6502),
+        .i_rdy(cpu_ready_o),
+        .i_nmi_n(1'b1),
+        .i_irq_n(!cpu_irq_sync[1]),   // real PET IRQ (PIA1 CB1 etc.)
+        .i_so_n(1'b1),
+        .o_sync(m6502_sync),
+        .i_bus_data(cpu_data_i),
+        .o_bus_data(m6502_dout),
+        .o_bus_addr(m6502_addr),
+        .o_rw(m6502_rw),
+        .i_debug_sel(3'b0),
+        .o_debug_data()
+    );
+
+    // Muxed "active CPU" signals that every downstream consumer uses, so the
+    // same decode/peripheral/bus logic serves whichever CPU owns the bus.
+    // Address/write-select/write-data are a 3-way select (6809 / soft 6502 /
+    // physical 6502 pins). The bus-enable + timing strobes are shared by both
+    // 6502 variants (they run at the base arbiter cadence), so those stay a
+    // 2-way "6809 vs base" mux.
+    wire [CPU_ADDR_WIDTH-1:0] active_cpu_addr    = cpu_is_6809     ? mc6809_addr
+                                                 : cpu_is_soft6502 ? m6502_addr
+                                                 :                   cpu_addr_i;
+    wire                      active_cpu_we      = cpu_is_6809     ? !mc6809_rnw
+                                                 : cpu_is_soft6502 ? !m6502_rw
+                                                 :                   cpu_we_i;
+    wire [    DATA_WIDTH-1:0] active_cpu_dout    = cpu_is_6809 ? mc6809_dout : m6502_dout;
+    wire                      active_be          = cpu_is_6809 ? cpu6809_be           : timing_cpu_be;
+    wire                      active_addr_strobe = cpu_is_6809 ? cpu6809_addr_strobe  : cpu_addr_strobe;
+    wire                      active_data_strobe = cpu_is_6809 ? cpu6809_data_strobe  : cpu_data_strobe;
+    wire                      active_wr_en       = cpu_is_6809 ? cpu6809_wr_en        : cpu_wr_en;
+
+    // Physical-6502 presence detector. When the physical CPU is selected
+    // (cpu_soft=0) and running, a populated chip drives the shared address bus
+    // (cpu_addr_i) with its fetch sequence. An empty socket leaves the bus
+    // floating, so match all three fetches of a JMP-self loop rather than
+    // any bus activity. Armed/cleared by a REG_CPU_SEL write.
+    localparam logic [CPU_ADDR_WIDTH-1:0] PROBE_LOOP_ADDR = 16'h0400;
+
+    logic       cpu_sel_wr;
+    logic       phys_cpu_active = 1'b0;
+    logic [2:0] phys_probe_seen = '0;
+    always_ff @(posedge sys_clock_i) begin
+        if (cpu_sel_wr) begin
+            phys_cpu_active <= 1'b0;
+            phys_probe_seen <= '0;
+        end else if (!cpu_soft && active_data_strobe) begin
+            if (cpu_addr_i == PROBE_LOOP_ADDR)           phys_probe_seen[0] <= 1'b1;
+            if (cpu_addr_i == PROBE_LOOP_ADDR + 16'd1)   phys_probe_seen[1] <= 1'b1;
+            if (cpu_addr_i == PROBE_LOOP_ADDR + 16'd2)   phys_probe_seen[2] <= 1'b1;
+            if (&phys_probe_seen) phys_cpu_active <= 1'b1;
+        end
+    end
+
+    wire cpu_wr_strobe = active_data_strobe && active_cpu_we;
 
     //
     // Wishbone <-> RAM Bridge
@@ -241,11 +429,14 @@ module main (
         .video_graphic_i(graphic_i),
         .config_crt_i(config_crt_i),
         .config_keyboard_i(config_keyboard_i),
+        .phys_cpu_active_i(phys_cpu_active),
 
         // CPU control register
         .cpu_ready_o(reg_cpu_ready),
         .cpu_reset_o(cpu_reset_o),
         .cpu_nmi_o(cpu_nmi_o),
+        .cpu_sel_o(cpu_sel),
+        .cpu_sel_wr_o(cpu_sel_wr),
 
         // Breakpoint
         .bp_halted_i(bp_halted),
@@ -262,13 +453,19 @@ module main (
     // Breakpoint Detection
     //
 
+    // cpu_sync_i floats with the socket empty, so soft cores use their own
+    // fetch marker. The 6809 has none, so breakpoints are 6502-only.
+    wire bp_sync = cpu_is_6809     ? 1'b0
+                 : cpu_is_soft6502 ? m6502_sync
+                 :                   cpu_sync_i;
+
     breakpoint breakpoint (
         .sys_clock_i(sys_clock_i),
-        .cpu_sync_i(cpu_sync_i),
-        .cpu_data_i(cpu_data_i),
-        .cpu_addr_i(cpu_addr_i),
-        .cpu_data_strobe_i(cpu_data_strobe),
-        .cpu_be_i(cpu_be_o),
+        .cpu_sync_i(bp_sync),
+        .cpu_data_i(cpu_data_q),
+        .cpu_addr_i(active_cpu_addr),
+        .cpu_data_strobe_i(active_data_strobe),
+        .cpu_be_i(active_be),
         .cpu_ready_i(reg_cpu_ready),
         .clear_i(bp_clear),
         .cpu_ready_o(cpu_ready_o),
@@ -290,6 +487,9 @@ module main (
     logic unmapped;
     logic is_vram;
     logic is_readonly;
+    logic decoded_a12;
+    logic decoded_a13;
+    logic decoded_a14;
     logic decoded_a15;
     logic decoded_a16;
 
@@ -297,10 +497,11 @@ module main (
         .reset_i(cpu_reset_i),
         .sys_clock_i(sys_clock_i),
         
-        .cpu_be_i(cpu_be_o),
+        .cpu_be_i(active_be),
         .cpu_wr_strobe_i(cpu_wr_strobe),
-        .cpu_addr_i(cpu_addr_i),
-        .cpu_data_i(cpu_data_i),
+        .cpu_addr_i(active_cpu_addr),
+        .cpu_data_i(cpu_data_q),
+        .superpet_en_i(cpu_is_6809),   // SuperPET MMU only when the soft 6809 owns the bus
 
         .ram_en_o(ram_en),
         .pia1_en_o(pia1_en),
@@ -313,8 +514,17 @@ module main (
         .is_vram_o(is_vram),
 
         .is_readonly_o(is_readonly),
+        .decoded_a12_o(decoded_a12),
+        .decoded_a13_o(decoded_a13),
+        .decoded_a14_o(decoded_a14),
         .decoded_a15_o(decoded_a15),
-        .decoded_a16_o(decoded_a16)
+        .decoded_a16_o(decoded_a16),
+
+        // Super-OS/9 MMU: SYNC bus state is BA=1/BS=0 on the 6809.
+        .sync_i(mc6809_ba && !mc6809_bs),
+        .superpet_flat_o(superpet_flat),
+        .superpet_wp_o(superpet_wp),
+        .superpet_firq_n_o(superpet_firq_n)
     );
 
     //
@@ -323,6 +533,9 @@ module main (
 
     logic [WB_ADDR_WIDTH-1:0] video_addr;    // Captured address for read
     logic [   DATA_WIDTH-1:0] video_din;     // Peripheral -> Video (WE=0)
+    // Must be declared before the video instantiation -- Synplify infers an
+    // implicit undriven net from a forward reference.
+    logic [   DATA_WIDTH-1:0] video_din_ov;
     logic                     video_we;
     logic                     video_cycle;
     logic                     video_strobe;
@@ -341,7 +554,7 @@ module main (
         // Wishbone controller used to fetch VRAM/VROM data
         .wb_clock_i(sys_clock_i),
         .wbc_addr_o(video_addr),
-        .wbc_data_i(video_din),
+        .wbc_data_i(video_din_ov),   // HUD overlay substitutes VRAM reads in-range
         .wbc_we_o(video_we),
         .wbc_cycle_o(video_cycle),
         .wbc_strobe_o(video_strobe),
@@ -367,9 +580,9 @@ module main (
 
         .cpu_reset_i(cpu_reset_i),
         .crtc_clk_en_i(cpu_data_strobe),      // 1 MHz clock enable for 'sys_clock_i'
-        .crtc_cs_i(crtc_en),                // Asserted by address decoding when 'cpu_addr_i' is in CRTC range
-        .crtc_rs_i(cpu_addr_i[0]),          // Register select (0 = write address/read status, 1 = read addressed register)
-        .crtc_we_i(cpu_we_i),               // Direction of data transfers (0 = reading from CRTC, 1 = writing to CRTC)
+        .crtc_cs_i(crtc_en),                // Asserted by address decoding when 'active_cpu_addr' is in CRTC range
+        .crtc_rs_i(active_cpu_addr[0]),     // Register select (0 = write address/read status, 1 = read addressed register)
+        .crtc_we_i(active_cpu_we),          // Direction of data transfers (0 = reading from CRTC, 1 = writing to CRTC)
         .crtc_data_i(cpu_data_i),           // CPU -> CRTC
         .crtc_data_o(crtc_dout),            // CRTC -> CPU
         .crtc_data_oe(crtc_oe),             // Asserted when CPU is reading from CRTC
@@ -390,21 +603,18 @@ module main (
     //
     // Audio
     //
-
-    audio audio(
+    audio audio (
         .reset_i(cpu_reset_i),
         .sys_clock_i(sys_clock_i),
         .clk1_en_i(load_sr1),
         .cpu_wr_strobe_i(cpu_wr_strobe),
         .sid_en_i(sid_en),
-        .addr_i(cpu_addr_i[4:0]),
-        .data_i(cpu_data_i),
+        .addr_i(active_cpu_addr[SID_ADDR_REG_WIDTH-1:0]),
+        .data_i(cpu_data_q),
+        .data_o(),                 // TODO: Read back from SID?
         .diag_i(diag_i),
         .via_cb2_i(via_cb2_i),
-        .audio_o(audio_o),
-
-        // TODO: Read back from SID?
-        .data_o()
+        .audio_o(audio_o)
     );
 
     //
@@ -453,16 +663,91 @@ module main (
         .wbp_ack_o(kbd_wb_ack),
         .wbp_sel_i(kbd_wb_sel),
         
-        .cpu_be_i(cpu_be_o),
-        .cpu_data_strobe_i(cpu_data_strobe),
-        .cpu_data_i(cpu_data_i),
+        .cpu_be_i(active_be),
+        .cpu_data_strobe_i(active_data_strobe),
+        .cpu_data_i(cpu_data_q),
         .cpu_data_o(io_dout),
         .cpu_data_oe(io_doe),
-        .cpu_we_i(cpu_we_i),
+        .cpu_we_i(active_cpu_we),
 
         .pia1_cs_i(pia1_en),
-        .pia1_rs_i(cpu_addr_i[PIA_RS_WIDTH-1:0])
+        .pia1_rs_i(active_cpu_addr[PIA_RS_WIDTH-1:0])
     );
+
+    //
+    // IEEE-488 drive emulation
+    //
+
+    logic [DATA_WIDTH-1:0] ieee_wb_din;
+    logic                  ieee_wb_stall;
+    logic                  ieee_wb_ack;
+
+    logic [DATA_WIDTH-1:0] ieee_dout;
+    logic                  ieee_doe;
+
+    ieee ieee (
+        .wb_clock_i(sys_clock_i),
+        .wbp_addr_i(wb_addr),
+        .wbp_data_i(wb_dout),
+        .wbp_data_o(ieee_wb_din),
+        .wbp_we_i(wb_we),
+        .wbp_cycle_i(wb_cycle),
+        .wbp_strobe_i(wb_strobe),
+        .wbp_stall_o(ieee_wb_stall),
+        .wbp_ack_o(ieee_wb_ack),
+        .wbp_sel_i(ieee_wb_sel),
+
+        .cpu_be_i(active_be),
+        .cpu_addr_strobe_i(active_addr_strobe),
+        .cpu_data_strobe_i(active_data_strobe),
+        .cpu_data_i(cpu_data_q),
+        .cpu_data_o(ieee_dout),
+        .cpu_data_oe(ieee_doe),
+        .cpu_we_i(active_cpu_we),
+
+        .pia1_cs_i(pia1_en),
+        .pia2_cs_i(pia2_en),
+        .via_cs_i(via_en),
+        .rs_i(active_cpu_addr[VIA_RS_WIDTH-1:0]),
+
+        .diag_i(diag_i),
+        .vert_i(vert_drive_o)
+    );
+
+    //
+    // HUD overlay device (see hud.sv)
+    //
+
+    logic [DATA_WIDTH-1:0] hud_wb_din;    // HUD peripheral -> bus (register read-back)
+    logic                  hud_wb_stall;
+    logic                  hud_wb_ack;
+
+    logic                  hud_ov_active; // substitute the video read this cycle
+    logic [DATA_WIDTH-1:0] hud_ov_char;   // HUD character to substitute
+
+    hud hud (
+        .wb_clock_i(sys_clock_i),
+
+        // Peripheral (MCU writes buffer + control regs)
+        .wbp_addr_i(wb_addr),
+        .wbp_data_i(wb_dout),
+        .wbp_data_o(hud_wb_din),
+        .wbp_we_i(wb_we),
+        .wbp_cycle_i(wb_cycle),
+        .wbp_strobe_i(wb_strobe),
+        .wbp_stall_o(hud_wb_stall),
+        .wbp_ack_o(hud_wb_ack),
+        .wbp_sel_i(hud_wb_sel),
+
+        // Scan-out substitution over the video controller's VRAM reads
+        .vid_addr_i(video_addr),
+        .ov_active_o(hud_ov_active),
+        .ov_char_o(hud_ov_char)
+    );
+
+    // Substituted character flows through video.sv's existing character-ROM
+    // path unchanged.
+    assign video_din_ov = hud_ov_active ? hud_ov_char : video_din;
 
     //
     // Wishbone
@@ -501,9 +786,9 @@ module main (
 
     // One bus -> many peripherals
     wbp_mux #(
-        .COUNT(5)
+        .COUNT(7)
     ) wbp_mux (
-        .wbp_sel_i({ ram_wb_sel, reg_wb_sel, kbd_wb_sel, crtc_wb_sel, bram_wb_sel }),
+        .wbp_sel_i({ ram_wb_sel, reg_wb_sel, kbd_wb_sel, crtc_wb_sel, bram_wb_sel, ieee_wb_sel, hud_wb_sel }),
 
         // Wishbone Bus
         .wb_din_o(wb_din),
@@ -511,9 +796,9 @@ module main (
         .wb_ack_o(wb_ack),
 
         // Wishbone peripherals to mux
-        .wbp_din_i({ ram_wb_din, reg_wb_din, kbd_wb_din, crtc_wb_din, bram_wb_din }),
-        .wbp_stall_i({ ram_wb_stall, reg_wb_stall, kbd_wb_stall, crtc_wb_stall, bram_wb_stall }),
-        .wbp_ack_i({ ram_wb_ack, reg_wb_ack, kbd_wb_ack, crtc_wb_ack, bram_wb_ack })
+        .wbp_din_i({ ram_wb_din, reg_wb_din, kbd_wb_din, crtc_wb_din, bram_wb_din, ieee_wb_din, hud_wb_din }),
+        .wbp_stall_i({ ram_wb_stall, reg_wb_stall, kbd_wb_stall, crtc_wb_stall, bram_wb_stall, ieee_wb_stall, hud_wb_stall }),
+        .wbp_ack_i({ ram_wb_ack, reg_wb_ack, kbd_wb_ack, crtc_wb_ack, bram_wb_ack, ieee_wb_ack, hud_wb_ack })
     );
 
     //
@@ -525,82 +810,179 @@ module main (
 
     open_bus open_bus (
         .sys_clock_i(sys_clock_i),
-        .cpu_data_strobe_i(cpu_data_strobe),
-        .cpu_data_i(cpu_data_i),
+        .cpu_data_strobe_i(active_data_strobe),
+        .cpu_data_i(cpu_data_q),
         .unmapped_i(unmapped),
-        .cpu_be_i(cpu_be_o),
-        .cpu_we_i(cpu_we_i),
+        .cpu_be_i(active_be),
+        .cpu_we_i(active_cpu_we),
         .data_o(open_bus_dout),
         .data_oe(open_bus_oe)
     );
 
+    // Soft cores have no bus pins, so the FPGA drives their write data.
+    wire cpu_driving_data_bus = cpu_soft && active_be && active_cpu_we;
+
+    logic [DATA_WIDTH-1:0] cpu_data_mux_out;
+
+    //
+    // SuperPET RS-232: soft 6551 ACIA at $EFF0-$EFF3
+    //
+    logic [DATA_WIDTH-1:0] acia_dout;
+    logic                  acia_doe;
+
+    acia6551 acia6551 (
+        .sys_clock_i(sys_clock_i),
+        .reset_i(cpu_reset_i),
+
+        .cpu_be_i(active_be),
+        .cpu_data_strobe_i(active_data_strobe),
+        .cpu_addr_i(active_cpu_addr),
+        .cpu_data_i(cpu_data_q),
+        .cpu_data_o(acia_dout),
+        .cpu_data_oe(acia_doe),
+        .cpu_we_i(active_cpu_we),
+        // The RS-232 port exists only in 6809 mode, and flat mode maps
+        // $EFF0-$EFF3 as RAM, so gate the ACIA off in both cases.
+        .enable_i(cpu_is_6809 && !superpet_flat),
+
+        .txd_o(uart_txd_o),
+        .rxd_i(uart_rxd_i),
+        .rts_n_o(uart_rts_n_o),
+        .cts_n_i(uart_cts_n_i),
+        .dtr_n_o(),                  // no pin budget; HOSTCM doesn't need it
+        .dsr_n_i(1'b0),              // strapped asserted (in-band flow control)
+        .dcd_n_i(1'b0),
+
+        .irq_o(acia_irq)
+    );
+
+    //
+    // SuperPET 6702 security dongle at $EFE0 (Waterloo startup checks it)
+    //
+    logic [DATA_WIDTH-1:0] dongle_dout;
+    logic                  dongle_doe;
+
+    dongle6702 dongle6702 (
+        .sys_clock_i(sys_clock_i),
+        .reset_i(cpu_reset_i),
+        .cpu_be_i(active_be),
+        .cpu_data_strobe_i(active_data_strobe),
+        .cpu_addr_i(active_cpu_addr),
+        .cpu_data_i(cpu_data_q),
+        .cpu_data_o(dongle_dout),
+        .cpu_data_oe(dongle_doe),
+        .cpu_we_i(active_cpu_we),
+        // The dongle exists only in 6809 mode, and flat mode maps $EFE0
+        // as RAM, so gate it off in both cases.
+        .enable_i(cpu_is_6809 && !superpet_flat)
+    );
+
     // Many controllers -> System data bus
     cpu_data_mux #(
-        .COUNT(4)
+        .COUNT(8)
     ) cpu_data_mux (
-        .data_i({ open_bus_dout, ram_ctl_dout, crtc_dout, io_dout }),
-        .oe_i({ open_bus_oe, ram_ctl_doe, crtc_oe & cpu_be_o, io_doe & cpu_be_o & !cpu_we_i }),
-        .data_o(cpu_data_o),
+        .data_i({ open_bus_dout, ram_ctl_dout, crtc_dout, io_dout, ieee_dout, acia_dout, dongle_dout, active_cpu_dout }),
+        // The write term drives data for the whole BE window (like a real
+        // CPU), not just cpu_wr_en -- dropping data at WE's rising edge
+        // races the SRAM latch.
+        // ieee_doe never overlaps open_bus (it claims mapped PIA/VIA reads),
+        // so only the $EFxx peripherals mask it.
+        .oe_i({ open_bus_oe & !acia_doe & !dongle_doe, ram_ctl_doe, crtc_oe & active_be, io_doe & active_be & !active_cpu_we, ieee_doe & active_be & !active_cpu_we, acia_doe & active_be & !active_cpu_we, dongle_doe & active_be & !active_cpu_we, cpu_driving_data_bus }),
+        .data_o(cpu_data_mux_out),
         .oe_o(cpu_data_oe)
     );
 
-    wire cpu_rd_en = cpu_be_o && !cpu_we_i;
+    // Register the pad output; the mux select cone can miss timing. Sources
+    // are stable for multiple cycles, so the delay is harmless. cpu_data_oe
+    // stays combinational (false-pathed in the SDC).
+    always_ff @(posedge sys_clock_i) begin
+        cpu_data_o <= cpu_data_mux_out;
+    end
 
-    assign io_oe_o   = io_en   && cpu_be_o && !io_doe;
-    assign pia1_cs_o = pia1_en && cpu_be_o && !io_doe;
-    assign pia2_cs_o = pia2_en && cpu_be_o;
-    assign via_cs_o  =  via_en && cpu_be_o;
+    wire cpu_rd_en = active_be && !active_cpu_we;
+
+    // A fabric peripheral claiming the bus (IEEE/ACIA/dongle data_oe) must also
+    // suppress the external I/O chip selects, or the FPGA and a real
+    // PIA/VIA drive the data bus in the same cycle. io_doe (the keyboard
+    // intercept) only shadows PIA1, so pia2/via omit it.
+    assign io_oe_o   = io_en   && active_be && !io_doe && !ieee_doe && !acia_doe && !dongle_doe;
+    assign pia1_cs_o = pia1_en && active_be && !io_doe && !ieee_doe && !acia_doe && !dongle_doe;
+    assign pia2_cs_o = pia2_en && active_be && !ieee_doe && !acia_doe && !dongle_doe;
+    assign via_cs_o  =  via_en && active_be && !ieee_doe && !acia_doe && !dongle_doe;
 
     assign ram_oe_o         = (cpu_rd_en && ram_en) || ram_ctl_oe;
-    assign ram_we_o         = (cpu_wr_en && cpu_we_i && ram_en && !is_readonly) || ram_ctl_we;
+    assign ram_we_o         = (active_wr_en && active_cpu_we && ram_en && !is_readonly
+                                && !superpet_wp) || ram_ctl_we;
 
-    assign cpu_addr_oe      = !cpu_be_o;
-    assign cpu_addr_o       = ram_ctl_addr[15:0];
+    // A soft core has no bus pins, so the FPGA drives the address during its
+    // window and during every WB<->RAM bridge slot. With the physical 6502
+    // selected, the FPGA drives only the bridge slots.
+    assign cpu_addr_oe      = cpu_soft || !active_be;
+
+    // SRAM A12-A14 have no dedicated FPGA pins on this PCB -- they are wired
+    // straight to the shared bus A12-A14. With the soft 6809 the FPGA drives
+    // the whole bus anyway, so full 16-bank $9000-$9FFF switching needs no
+    // hardware changes: splice the bank-translated a12-a14 (identity outside
+    // the banked window) into the bus address during the CPU's bus window.
+    // External I/O never sees the difference (chip selects and register
+    // selects come from active_cpu_addr inside the FPGA / bus A0-A1 only);
+    // the WB<->RAM bridge already drives translated addresses on these same
+    // lines every non-CPU slot.
+    assign cpu_addr_o       = active_be
+        ? { active_cpu_addr[15], decoded_a14, decoded_a13, decoded_a12, active_cpu_addr[11:0] }
+        : ram_ctl_addr[15:0];
+
+    // R/W feeds the U8 level shifter and the PIA/VIA R/W inputs with no
+    // pull-up on the net (see MAGIC.kicad_sch), so it must be driven
+    // whenever a soft core owns the bus -- and released for the physical
+    // CPU, which drives its own R/W pin.
+    assign cpu_we_oe        = cpu_soft && active_be;
+    assign cpu_we_o         = active_cpu_we;
 
     wire ram_addr_a10_mask = !is_vram | video_ram_mask[10];
     wire ram_addr_a11_mask = !is_vram | video_ram_mask[11];
 
     // When the CPU is driving the bus, apply masks to RAM A10/A11 to wrap video memory.
-    assign ram_addr_a10_o = cpu_be_o
-        ? cpu_addr_i[10] & ram_addr_a10_mask
+    assign ram_addr_a10_o = active_be
+        ? active_cpu_addr[10] & ram_addr_a10_mask
         : cpu_addr_o[10];
 
-    assign ram_addr_a11_o = cpu_be_o
-        ? cpu_addr_i[11] & ram_addr_a11_mask
+    assign ram_addr_a11_o = active_be
+        ? active_cpu_addr[11] & ram_addr_a11_mask
         : cpu_addr_o[11];
 
     // When the CPU is driving the bus, the control register at $FFF0 controls
     // the memory mapping for the upper 64k expansion.
-    assign ram_addr_a15_o = cpu_be_o ? decoded_a15 : cpu_addr_o[15];
-    assign ram_addr_a16_o = cpu_be_o ? decoded_a16 : ram_ctl_addr[16];
+    assign ram_addr_a15_o = active_be ? decoded_a15 : cpu_addr_o[15];
+    assign ram_addr_a16_o = active_be ? decoded_a16 : ram_ctl_addr[16];
 
     // synthesis off
-    
+
     // At most one source may drive the CPU data bus at a time:
-    //   cpu           - CPU (writing to bus when be_o and we_i are asserted)
     //   ram_oe_o      - External SRAM (output enabled)
     //   io_oe_o       - External IO chips (PIA1, PIA2, VIA) when selected and CPU is reading
-    //   cpu_data_oe   - FPGA (keyboard intercept, CRTC, WB-RAM bridge)
-    wire cpu_driving_data_bus = cpu_be_o && cpu_we_i;
+    //   cpu_data_oe   - FPGA (keyboard intercept, CRTC, WB-RAM bridge, and a soft
+    //                   core's own write data, which the FPGA must drive since the
+    //                   core has no bus pins of its own)
     wire ram_driving_data_bus = ram_oe_o;
-    wire io_driving_data_bus = io_oe_o && !cpu_we_i;
+    wire io_driving_data_bus = io_oe_o && !active_cpu_we;
     wire fpga_driving_data_bus = cpu_data_oe;
 
-    wire [3:0] dbg_data_bus_drivers = {cpu_driving_data_bus, ram_driving_data_bus, io_driving_data_bus, fpga_driving_data_bus};
+    wire [2:0] dbg_data_bus_drivers = {ram_driving_data_bus, io_driving_data_bus, fpga_driving_data_bus};
     wire [1:0] dbg_ram_oe_we = {ram_oe_o, ram_we_o};
 
     always_ff @(posedge sys_clock_i or negedge sys_clock_i) begin
-        assert(!cpu_be_o || !ram_wb_stall) else $fatal(1, "WB<->RAM bridge must be stalled when CPU is driving bus");
-        assert(!cpu_be_o || !ram_ctl_oe)   else $fatal(1, "WB<->RAM bridge must not assert OE when CPU is driving bus");
-        assert(!cpu_be_o || !ram_ctl_we)   else $fatal(1, "WB<->RAM bridge must not assert WE when CPU is driving bus");
-        assert(!cpu_be_o || !ram_wb_ack)   else $fatal(1, "WB<->RAM bridge must not assert ACK when CPU is driving bus");
-        assert(!io_oe_o  ||  cpu_be_o)     else $fatal(1, "IO must not be active unless CPU is driving bus");
-        assert(!io_oe_o  || !ram_we_o)     else $fatal(1, "IO and RAM_WE must not be active at same time");
-        
-        assert(!ram_we_o || ram_ctl_doe || (cpu_driving_data_bus && cpu_clock_o))
+        assert(!active_be || !ram_wb_stall) else $fatal(1, "WB<->RAM bridge must be stalled when CPU is driving bus");
+        assert(!active_be || !ram_ctl_oe)   else $fatal(1, "WB<->RAM bridge must not assert OE when CPU is driving bus");
+        assert(!active_be || !ram_ctl_we)   else $fatal(1, "WB<->RAM bridge must not assert WE when CPU is driving bus");
+        assert(!active_be || !ram_wb_ack)   else $fatal(1, "WB<->RAM bridge must not assert ACK when CPU is driving bus");
+        assert(!io_oe_o  ||  active_be)     else $fatal(1, "IO must not be active unless CPU is driving bus");
+        assert(!io_oe_o  || !ram_we_o)      else $fatal(1, "IO and RAM_WE must not be active at same time");
+
+        assert(!ram_we_o || ram_ctl_doe || (cpu_driving_data_bus && active_wr_en))
             else $fatal(1, "RAM_WE asserted but valid data not driven to bus");
-        
-        assert($onehot0(dbg_data_bus_drivers)) else $fatal(1, "Multiple drivers on CPU data bus: {cpu, ram, io, fpga}=%b", dbg_data_bus_drivers);
+
+        assert($onehot0(dbg_data_bus_drivers)) else $fatal(1, "Multiple drivers on CPU data bus: {ram, io, fpga}=%b", dbg_data_bus_drivers);
         assert($onehot0(dbg_ram_oe_we)) else $fatal(1, "RAM must be reading or writing, not both: {ram_oe, ram_we}=%b", dbg_ram_oe_we);
     end
     // synthesis on

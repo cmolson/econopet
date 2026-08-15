@@ -108,6 +108,23 @@ package common_pkg;
     localparam int CPU_tDHW = 10;   // Write Data Hold Time (min)
 
     //
+    // MC6809E CPU Timing (ns) -- standard grade (1 MHz)
+    // Source: https://www.bitsavers.org/components/motorola/_dataSheets/6809E.pdf
+    //
+    // tCYC is checked by timing_6809.sv; the rest are recorded for reference.
+    //
+
+    localparam int CPU6809_tCYC = 1000;  // Cycle Time (min)
+    localparam int CPU6809_PWEL = 450;   // Pulse Width, E Low (min)
+    localparam int CPU6809_PWEH = 450;   // Pulse Width, E High (min)
+    localparam int CPU6809_tEQ1 = 200;   // Delay Time, E to Q Rise (min)
+    localparam int CPU6809_tAD  = 200;   // Address Delay Time from E Low (max)
+    localparam int CPU6809_tDSR = 80;    // Read Data Setup Time (min)
+    localparam int CPU6809_tDHR = 10;    // Read Data Hold Time (min)
+    localparam int CPU6809_tDDQ = 200;   // Write Data Delay Time from Q (max)
+    localparam int CPU6809_tDHW = 30;    // Write Data Hold Time (min)
+
+    //
     // W65C21N/W65C22N PIA/VIA Timing (ns)
     // See docs/dev/timing.md for details.
     //
@@ -385,6 +402,7 @@ package common_pkg;
     localparam int unsigned REG_STATUS_CRT_BIT      = 1;    // Diagonal CRT size (0 = 12", 1 = 9")
     localparam int unsigned REG_STATUS_KEYBOARD_BIT = 2;    // Keyboard Type (0 = Business, 1 = Graphics)
     localparam int unsigned REG_STATUS_BP_HALT_BIT  = 3;    // Breakpoint halt (1 = CPU halted on STP fetch)
+    localparam int unsigned REG_STATUS_PHYS_CPU_BIT = 4;    // Physical 6502 detected (probe loop seen at $0400)
 
     // Register 1: CPU control
     localparam int unsigned REG_CPU                 = 1;
@@ -408,7 +426,14 @@ package common_pkg;
     // Register 4: Breakpoint Address High (Read-only)
     localparam int unsigned REG_BP_ADDR_HI              = 4;
 
-    localparam int unsigned REG_COUNT                   = REG_BP_ADDR_HI + 1'b1;
+    // Register 5: CPU select. Separate from REG_CPU so the
+    // firmware's reset/ready writes can't clobber it.
+    localparam int unsigned REG_CPU_SEL                 = 5;
+    localparam logic [1:0]  CPU_SEL_PHYS_6502           = 2'd0,  // physical W65C02S
+                            CPU_SEL_SOFT_6809           = 2'd1,  // soft MC6809 (SuperPET)
+                            CPU_SEL_SOFT_6502           = 2'd2;  // soft MOS 6502 (virtual)
+
+    localparam int unsigned REG_COUNT                   = REG_CPU_SEL + 1'b1;
 
     //
     // Bus
@@ -439,6 +464,8 @@ package common_pkg;
     localparam WB_CRTC_BASE = 4'b0101;
     localparam WB_KBD_BASE  = 5'b01100;
     localparam WB_BRAM_BASE = 5'b01101;
+    localparam WB_IEEE_BASE = 5'b01110;
+    localparam WB_HUD_BASE  = 5'b01111;
     localparam WB_VRAM_BASE = { WB_RAM_BASE, 7'b0010000 };   // SRAM: $8000-87FF
     localparam WB_VROM_BASE = { WB_RAM_BASE, 7'b0011101 };   // SRAM: $E800-EFFF
 
@@ -458,8 +485,40 @@ package common_pkg;
         return { WB_CRTC_BASE, (WB_ADDR_WIDTH - CRTC_ADDR_REG_WIDTH - $bits(WB_CRTC_BASE))'('0), register };
     endfunction
 
+    // IEEE-488 drive emulation registers (see ieee.sv)
+    localparam int unsigned IEEE_REG_ADDR_WIDTH = 3;
+    localparam IEEE_REG_CTRL    = 3'd0;   // bit0 = enable, bit1 = flush FIFOs/state
+    localparam IEEE_REG_STATUS  = 3'd1;   // see ieee.sv
+    localparam IEEE_REG_RX      = 3'd2;   // read = head byte, write = pop
+    localparam IEEE_REG_TX      = 3'd3;   // write pushes device->CPU byte
+    localparam IEEE_REG_TX_LAST = 3'd4;   // write pushes final byte (EOI)
+    localparam IEEE_REG_SA      = 3'd5;   // last secondary address byte
+    localparam IEEE_REG_TXS      = 3'd6;  // write pushes status-channel byte
+    localparam IEEE_REG_TXS_LAST = 3'd7;  // write pushes final status byte (EOI)
+
+    function logic[WB_ADDR_WIDTH-1:0] wb_ieee_addr(input logic[IEEE_REG_ADDR_WIDTH-1:0] register);
+        return { WB_IEEE_BASE, (WB_ADDR_WIDTH - IEEE_REG_ADDR_WIDTH - $bits(WB_IEEE_BASE))'('0), register };
+    endfunction
+
     function logic[WB_ADDR_WIDTH-1:0] wb_kbd_addr(input logic[KBD_COL_WIDTH-1:0] register);
         return { WB_KBD_BASE, (WB_ADDR_WIDTH - KBD_COL_WIDTH - $bits(WB_KBD_BASE))'('0), register };
+    endfunction
+
+    // Address layout within the HUD base (9 bits): bit 8 selects the control
+    // registers; bits [7:0] index the 256-byte text buffer (bit 8 = 0) or the
+    // control register (bit 8 = 1).
+    localparam int unsigned HUD_ADDR_WIDTH = 9;
+    localparam int unsigned HUD_BUF_SIZE   = 256;
+    localparam bit [HUD_ADDR_WIDTH-1:0] HUD_CTRL_FLAG = 9'h100;   // OR into address to reach control regs
+
+    // Control registers (accessed with bit 8 set).
+    localparam bit [3:0] HUD_REG_CTRL   = 4'd0,   // bit0 = enable
+                         HUD_REG_OFF_LO = 4'd1,   // VRAM base offset [7:0]
+                         HUD_REG_OFF_HI = 4'd2,   // VRAM base offset [10:8]
+                         HUD_REG_LEN    = 4'd3;    // characters to overlay (0 = none)
+
+    function logic[WB_ADDR_WIDTH-1:0] wb_hud_addr(input logic[HUD_ADDR_WIDTH-1:0] offset);
+        return { WB_HUD_BASE, (WB_ADDR_WIDTH - HUD_ADDR_WIDTH - $bits(WB_HUD_BASE))'('0), offset };
     endfunction
 
     function logic[WB_ADDR_WIDTH-1:0] wb_bram_addr(input logic[BRAM_ADDR_WIDTH-1:0] address);
