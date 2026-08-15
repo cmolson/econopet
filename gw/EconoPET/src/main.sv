@@ -31,6 +31,12 @@ module main (
     output logic cpu_we_o,
     output logic cpu_we_oe,
 
+    // SuperPET RS-232 (soft 6551 ACIA -> PMOD2, wired in top.sv)
+    output logic uart_txd_o,
+    input  logic uart_rxd_i,
+    output logic uart_rts_n_o,
+    input  logic uart_cts_n_i,
+
     // RAM
     output logic ram_addr_a10_o,
     output logic ram_addr_a11_o,
@@ -224,6 +230,11 @@ module main (
         cpu_irq_sync <= { cpu_irq_sync[0], cpu_irq_i };
     end
 
+    // Soft 6551 ACIA (RS-232) interrupt, ORed into the shared IRQ below --
+    // on the real board the 6551's open-drain ~IRQ is wire-ORed onto the
+    // same line as the motherboard PIA/VIA interrupts.
+    logic acia_irq;
+
     // Super-OS/9 MMU state (driven by address_decoding below).
     logic superpet_flat;
     logic superpet_wp;
@@ -264,7 +275,7 @@ module main (
         .Q(cpu6809_q),
         .BS(mc6809_bs),
         .BA(mc6809_ba),
-        .nIRQ(!cpu_irq_sync[1]),
+        .nIRQ(!(cpu_irq_sync[1] || acia_irq)),
         // No physical FIRQ line on this board (tied +5V on a real SuperPET
         // too); only the Super-OS/9 MMU pulses it, to wake the core out of
         // the flat-mode-exiting SYNC.
@@ -773,6 +784,38 @@ module main (
     logic [DATA_WIDTH-1:0] cpu_data_mux_out;
 
     //
+    // SuperPET RS-232: soft 6551 ACIA at $EFF0-$EFF3
+    //
+    logic [DATA_WIDTH-1:0] acia_dout;
+    logic                  acia_doe;
+
+    acia6551 acia6551 (
+        .sys_clock_i(sys_clock_i),
+        .reset_i(cpu_reset_i),
+
+        .cpu_be_i(active_be),
+        .cpu_data_strobe_i(active_data_strobe),
+        .cpu_addr_i(active_cpu_addr),
+        .cpu_data_i(cpu_data_q),
+        .cpu_data_o(acia_dout),
+        .cpu_data_oe(acia_doe),
+        .cpu_we_i(active_cpu_we),
+        // The RS-232 port exists only in 6809 mode, and flat mode maps
+        // $EFF0-$EFF3 as RAM, so gate the ACIA off in both cases.
+        .enable_i(cpu_is_6809 && !superpet_flat),
+
+        .txd_o(uart_txd_o),
+        .rxd_i(uart_rxd_i),
+        .rts_n_o(uart_rts_n_o),
+        .cts_n_i(uart_cts_n_i),
+        .dtr_n_o(),                  // no pin budget; HOSTCM doesn't need it
+        .dsr_n_i(1'b0),              // strapped asserted (in-band flow control)
+        .dcd_n_i(1'b0),
+
+        .irq_o(acia_irq)
+    );
+
+    //
     // SuperPET 6702 security dongle at $EFE0 (Waterloo startup checks it)
     //
     logic [DATA_WIDTH-1:0] dongle_dout;
@@ -795,13 +838,15 @@ module main (
 
     // Many controllers -> System data bus
     cpu_data_mux #(
-        .COUNT(7)
+        .COUNT(8)
     ) cpu_data_mux (
-        .data_i({ open_bus_dout, ram_ctl_dout, crtc_dout, io_dout, ieee_dout, dongle_dout, active_cpu_dout }),
+        .data_i({ open_bus_dout, ram_ctl_dout, crtc_dout, io_dout, ieee_dout, acia_dout, dongle_dout, active_cpu_dout }),
         // The write term drives data for the whole BE window (like a real
         // CPU), not just cpu_wr_en -- dropping data at WE's rising edge
         // races the SRAM latch.
-        .oe_i({ open_bus_oe & !dongle_doe, ram_ctl_doe, crtc_oe & active_be, io_doe & active_be & !active_cpu_we, ieee_doe & active_be & !active_cpu_we, dongle_doe & active_be & !active_cpu_we, cpu_driving_data_bus }),
+        // ieee_doe never overlaps open_bus (it claims mapped PIA/VIA reads),
+        // so only the $EFxx peripherals mask it.
+        .oe_i({ open_bus_oe & !acia_doe & !dongle_doe, ram_ctl_doe, crtc_oe & active_be, io_doe & active_be & !active_cpu_we, ieee_doe & active_be & !active_cpu_we, acia_doe & active_be & !active_cpu_we, dongle_doe & active_be & !active_cpu_we, cpu_driving_data_bus }),
         .data_o(cpu_data_mux_out),
         .oe_o(cpu_data_oe)
     );
@@ -815,14 +860,14 @@ module main (
 
     wire cpu_rd_en = active_be && !active_cpu_we;
 
-    // A fabric peripheral claiming the bus (IEEE/dongle data_oe) must also
+    // A fabric peripheral claiming the bus (IEEE/ACIA/dongle data_oe) must also
     // suppress the external I/O chip selects, or the FPGA and a real
     // PIA/VIA drive the data bus in the same cycle. io_doe (the keyboard
     // intercept) only shadows PIA1, so pia2/via omit it.
-    assign io_oe_o   = io_en   && active_be && !io_doe && !ieee_doe && !dongle_doe;
-    assign pia1_cs_o = pia1_en && active_be && !io_doe && !ieee_doe && !dongle_doe;
-    assign pia2_cs_o = pia2_en && active_be && !ieee_doe && !dongle_doe;
-    assign via_cs_o  =  via_en && active_be && !ieee_doe && !dongle_doe;
+    assign io_oe_o   = io_en   && active_be && !io_doe && !ieee_doe && !acia_doe && !dongle_doe;
+    assign pia1_cs_o = pia1_en && active_be && !io_doe && !ieee_doe && !acia_doe && !dongle_doe;
+    assign pia2_cs_o = pia2_en && active_be && !ieee_doe && !acia_doe && !dongle_doe;
+    assign via_cs_o  =  via_en && active_be && !ieee_doe && !acia_doe && !dongle_doe;
 
     assign ram_oe_o         = (cpu_rd_en && ram_en) || ram_ctl_oe;
     assign ram_we_o         = (active_wr_en && active_cpu_we && ram_en && !is_readonly

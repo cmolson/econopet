@@ -256,7 +256,7 @@ set_false_path -from [get_ports {cpu_reset_n_i}]
 # constraint is omitted to avoid warnings.
 set_false_path -from [get_ports {cpu_irq_n_i}]
 
-# pmod2_i is passed through combinationally to pmod1_o (debug loopback).
+# pmod2_i: UART RXD/~CTS, double-flop synchronized inside acia6551 -- async by design.
 # No synchronous timing requirement.
 set_false_path -from [get_ports {pmod2_i[*]}]
 
